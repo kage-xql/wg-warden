@@ -18,6 +18,7 @@ import com.google.zxing.qrcode.QRCodeWriter;
 import java.io.ByteArrayOutputStream;
 import java.net.InetAddress;
 import java.security.SecureRandom;
+import java.time.Instant;
 import java.util.*;
 
 @Service
@@ -54,6 +55,11 @@ public class PeerService {
         Peer peer=ownedPeer(userId,peerId);
         if(request.name()!=null){String name=request.name().trim();if(name.isBlank())throw new IllegalArgumentException("peer name cannot be blank");peer.setName(name);}
         if(request.privateKey()!=null&&!request.privateKey().isBlank())peer.setEncryptedPrivateKey(crypto.encrypt(request.privateKey().trim().getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        if(Boolean.TRUE.equals(request.clearTrafficLimit())){peer.setTrafficLimitBytes(null);}
+        else if(request.trafficLimitBytes()!=null){peer.setTrafficLimitBytes(request.trafficLimitBytes()>0?request.trafficLimitBytes():null);}
+        if(Boolean.TRUE.equals(request.clearExpiresAt())){peer.setExpiresAt(null);}
+        else if(request.expiresAt()!=null){peer.setExpiresAt(request.expiresAt());}
+        peers.save(peer);
         if(request.enabled()!=null&&peer.isEnabled()!=request.enabled())setEnabled(userId,peerId,request.enabled());
         return PeerResponse.from(peer);
     }
@@ -69,6 +75,9 @@ public class PeerService {
     @Transactional
     public PeerResponse setEnabled(UUID userId,UUID peerId,boolean enabled){
         Peer peer=ownedPeer(userId,peerId);
+        if(enabled&&peer.getExpiresAt()!=null&&!peer.getExpiresAt().isAfter(Instant.now())){
+            throw new IllegalArgumentException("Cannot enable peer: usage limit has expired. Update peer limits first.");
+        }
         interfaces.lockByIdAndServerId(peer.getInterfaceId(),serverIdFor(userId,peer)).orElseThrow(PeerNotFoundException::new);
         if(peer.isEnabled()!=enabled){
             Server server=servers.findByIdAndUserId(serverIdFor(userId,peer),userId).orElseThrow(ServerNotFoundException::new);
@@ -76,6 +85,7 @@ public class PeerService {
             WgInterface wg=interfaces.findById(peer.getInterfaceId()).orElseThrow(PeerNotFoundException::new);
             ssh.runSudoScript(server.getHost(),server.getSshPort(),server.getSshUser(),serverService.credentials(userId,server.getId()),server.getHostKeyFingerprint(),enabled?addPeerScript(wg.getName(),peer.getPublicKey(),address(peer.getAllowedIp())):removePeerScript(wg.getName(),peer.getPublicKey()));
             peer.setEnabled(enabled);
+            peers.save(peer);
         }
         return PeerResponse.from(peer);
     }
@@ -91,9 +101,11 @@ public class PeerService {
         peers.delete(peer);
     }
 
+    @Transactional
     public void disableForLimit(UUID userId,Peer peer){
         if(!peer.isEnabled())return; UUID serverId=serverIdFor(userId,peer); Server server=servers.findByIdAndUserId(serverId,userId).orElseThrow(ServerNotFoundException::new); ensurePinned(server); WgInterface wg=interfaces.findById(peer.getInterfaceId()).orElseThrow(PeerNotFoundException::new);
         ssh.runSudoScript(server.getHost(),server.getSshPort(),server.getSshUser(),serverService.credentials(userId,serverId),server.getHostKeyFingerprint(),removePeerScript(wg.getName(),peer.getPublicKey())); peer.setEnabled(false);
+        peers.save(peer);
     }
 
     private Peer ownedPeer(UUID userId,UUID peerId){

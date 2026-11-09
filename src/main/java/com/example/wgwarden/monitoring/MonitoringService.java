@@ -98,12 +98,18 @@ public class MonitoringService {
         if(serverMetric==null)throw new IllegalStateException("remote metrics response is incomplete");
         serverMetrics.save(serverMetric);List<MonitorUpdate.PeerUpdate> peerUpdates=new ArrayList<>();
         for(WgInterface wg:interfaces.findAllByServerIdOrderByName(serverId)) for(Peer peer:peers.findAllByInterfaceIdOrderByCreatedAtDesc(wg.getId())){
-            String[] values=peerDump.getOrDefault(wg.getName(),Map.of()).get(peer.getPublicKey());if(values==null)continue;
-            long epoch=counter(values[0]);Instant handshake=epoch==0?null:Instant.ofEpochSecond(epoch);
-            PeerMetric metric=peerMetrics.save(new PeerMetric(peer.getId(),now,counter(values[1]),counter(values[2]),handshake));
-            boolean expired=peer.getExpiresAt()!=null&&!peer.getExpiresAt().isAfter(now); boolean overTraffic=peer.getTrafficLimitBytes()!=null&&counter(values[1])+counter(values[2])>=peer.getTrafficLimitBytes();
-            if(expired||overTraffic)try{peerService.disableForLimit(server.getUserId(),peer);}catch(RuntimeException e){log.warn("Could not disable limited peer {}",peer.getId(),e);}
-            peerUpdates.add(new MonitorUpdate.PeerUpdate(peer.getId(),PeerMetricResponse.from(metric)));
+            boolean expired=peer.getExpiresAt()!=null&&!peer.getExpiresAt().isAfter(now);
+            String[] values=peerDump.getOrDefault(wg.getName(),Map.of()).get(peer.getPublicKey());
+            if(values!=null){
+                long epoch=counter(values[0]);Instant handshake=epoch==0?null:Instant.ofEpochSecond(epoch);
+                PeerMetric metric=peerMetrics.save(new PeerMetric(peer.getId(),now,counter(values[1]),counter(values[2]),handshake));
+                boolean overTraffic=peer.getTrafficLimitBytes()!=null&&counter(values[1])+counter(values[2])>=peer.getTrafficLimitBytes();
+                if(expired||overTraffic)try{peerService.disableForLimit(server.getUserId(),peer);}catch(RuntimeException e){log.warn("Could not disable limited peer {}",peer.getId(),e);}
+                peerUpdates.add(new MonitorUpdate.PeerUpdate(peer.getId(),peer.isEnabled(),PeerMetricResponse.from(metric)));
+            } else if(expired&&peer.isEnabled()){
+                try{peerService.disableForLimit(server.getUserId(),peer);}catch(RuntimeException e){log.warn("Could not disable expired peer {}",peer.getId(),e);}
+                peerUpdates.add(new MonitorUpdate.PeerUpdate(peer.getId(),peer.isEnabled(),null));
+            }
         }
         server.markOnline();events.publish(server.getUserId(),new MonitorUpdate(serverId,server.getStatus().name(),null,ServerMetricResponse.from(serverMetric),peerUpdates));
     }

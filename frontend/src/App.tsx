@@ -10,7 +10,7 @@ type PeerMetric={timestamp:string;rxBytes:number;txBytes:number;lastHandshake:st
 type PeerCreated={peer:Peer;config:string;qrCodePngBase64:string}
 type DiscoveredPeer={name:string;publicKey:string;allowedIp:string}
 type DiscoveredInterface={name:string;listenPort:number;subnet:string;publicKey:string;peers:DiscoveredPeer[]}
-type MonitorUpdate={serverId:string;status:string;connectionError:string|null;server:ServerMetric|null;peers:{peerId:string;metrics:PeerMetric}[]}
+type MonitorUpdate={serverId:string;status:string;connectionError:string|null;server:ServerMetric|null;peers:{peerId:string;enabled?:boolean;metrics:PeerMetric|null}[]}
 type ConfirmAction={title:string;message:string;onConfirm:()=>void}
 const TOKEN='wg-warden-token'
 
@@ -24,7 +24,15 @@ async function api<T>(path:string,token:string,init:RequestInit={}):Promise<T>{
 function bytes(n:number){if(n<1024)return `${n} B`;const units=['KB','MB','GB','TB'];let v=n/1024,i=0;while(v>=1024&&i<units.length-1){v/=1024;i++}return `${v.toFixed(1)} ${units[i]}`}
 function time(value:string){return new Date(value).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}
 function dateTime(value:string|null){return value?new Date(value).toLocaleString(): '—'}
-function peerLimits(peer:Peer){const parts=[];if(peer.trafficLimitBytes)parts.push(`≤ ${bytes(peer.trafficLimitBytes)}`);if(peer.expiresAt)parts.push(`until ${new Date(peer.expiresAt).toLocaleString()}`);return parts.join(' · ')}
+function peerLimits(peer:Peer){
+  const parts=[];
+  if(peer.trafficLimitBytes)parts.push(`≤ ${bytes(peer.trafficLimitBytes)}`);
+  if(peer.expiresAt){
+    const expired=new Date(peer.expiresAt).getTime()<=Date.now();
+    parts.push(`until ${new Date(peer.expiresAt).toLocaleString()}${expired?' (expired)':''}`);
+  }
+  return parts.join(' · ')
+}
 
 export default function App(){
   const [token,setToken]=useState(()=>localStorage.getItem(TOKEN)??'')
@@ -79,7 +87,12 @@ export default function App(){
               const update=JSON.parse(line.slice(5).trim()) as MonitorUpdate
               qc.setQueryData<Server[]>(['servers',token],old=>old?.map(s=>s.id===update.serverId?{...s,status:update.status as Server['status'],connectionError:update.connectionError}:s))
               if(update.server)qc.setQueryData<ServerMetric[]>(['server-metrics',token,update.serverId],old=>[...(old??[]),update.server!].slice(-1440))
-              for(const item of update.peers)qc.setQueryData<PeerMetric[]>(['peer-metrics',token,item.peerId],old=>[...(old??[]),item.metrics].slice(-1440))
+              for(const item of update.peers){
+                if(item.metrics)qc.setQueryData<PeerMetric[]>(['peer-metrics',token,item.peerId],old=>[...(old??[]),item.metrics!].slice(-1440))
+                if(typeof item.enabled==='boolean'){
+                  qc.setQueryData<Peer[]>(['peers',token,update.serverId],old=>old?.map(p=>p.id===item.peerId?{...p,enabled:item.enabled!}:p))
+                }
+              }
             }
           }
           if(!abort.signal.aborted)throw new Error('SSE stream ended')
@@ -177,7 +190,7 @@ function PeerForm({token,serverId,onCreated}:{token:string;serverId:string;onCre
 
 function LimitsDialog({trafficGb,durationDays,onClose,onSave}:{trafficGb:string;durationDays:string;onClose:()=>void;onSave:(traffic:string,days:string)=>void}){
   const [traffic,setTraffic]=useState(trafficGb);const [days,setDays]=useState(durationDays)
-  return <div className="overlay" onMouseDown={e=>e.target===e.currentTarget&&onClose()}><section className="dialog panel limits-dialog"><button className="close" onClick={onClose}>×</button><div className="eyebrow">PEER / LIMITS</div><h2>Configure peer limits</h2><p className="dialog-copy">Limits are applied automatically by monitoring. Leave a field empty for unlimited usage.</p><div className="form-stack"><label>Traffic limit (GB)<input type="number" min="1" step="1" value={traffic} onChange={e=>setTraffic(e.target.value)} placeholder="Unlimited"/></label><label>Usage limit (days)<input type="number" min="1" step="1" value={days} onChange={e=>setDays(e.target.value)} placeholder="Unlimited"/></label></div><div className="dialog-actions"><button className="button quiet" onClick={onClose}>Cancel</button><button className="button primary" onClick={()=>onSave(traffic,days)}>Apply limits</button></div></section></div>
+  return <div className="overlay" onMouseDown={e=>e.target===e.currentTarget&&onClose()}><section className="dialog panel limits-dialog"><button className="close" onClick={onClose}>×</button><div className="eyebrow">PEER / LIMITS</div><h2>Configure peer limits</h2><p className="dialog-copy">Limits are applied automatically by monitoring. Leave a field empty for unlimited usage.</p><div className="form-stack"><label>Traffic limit (GB)<input type="number" step="0.1" value={traffic} onChange={e=>setTraffic(e.target.value)} placeholder="Unlimited"/></label><label>Usage limit (days)<input type="number" step="1" value={days} onChange={e=>setDays(e.target.value)} placeholder="Unlimited"/></label></div><div className="dialog-actions"><button className="button quiet" onClick={onClose}>Cancel</button><button className="button primary" onClick={()=>onSave(traffic,days)}>Apply limits</button></div></section></div>
 }
 
 function ImportDialog({token,serverId,onClose,onImported}:{token:string;serverId:string;onClose:()=>void;onImported:()=>void}){
@@ -190,10 +203,33 @@ function ImportDialog({token,serverId,onClose,onImported}:{token:string;serverId
 }
 
 function PeerEditDialog({token,peer,onClose,onSaved}:{token:string;peer:Peer;onClose:()=>void;onSaved:()=>void}){
-  const [name,setName]=useState(peer.name);const [privateKey,setPrivateKey]=useState('');const [error,setError]=useState('')
-  const save=useMutation({mutationFn:()=>api<Peer>(`/api/peers/${peer.id}`,token,{method:'PATCH',body:JSON.stringify({name,privateKey:privateKey||undefined})}),onSuccess:onSaved,onError:e=>setError(e.message)})
+  const [name,setName]=useState(peer.name)
+  const [privateKey,setPrivateKey]=useState('')
+  const [trafficGb,setTrafficGb]=useState(peer.trafficLimitBytes?String(Math.round(peer.trafficLimitBytes/(1024*1024*1024))):'')
+  const [durationDays,setDurationDays]=useState(()=>{
+    if(!peer.expiresAt)return ''
+    const ms=new Date(peer.expiresAt).getTime()-Date.now()
+    return ms>0?String(Math.ceil(ms/86400000)):''
+  })
+  const [enabled,setEnabled]=useState(peer.enabled)
+  const [error,setError]=useState('')
+  const save=useMutation({mutationFn:(payload:object)=>api<Peer>(`/api/peers/${peer.id}`,token,{method:'PATCH',body:JSON.stringify(payload)}),onSuccess:onSaved,onError:e=>setError(e.message)})
   const config=useMutation({mutationFn:()=>api<PeerCreated>(`/api/peers/${peer.id}/config`,token),onSuccess:result=>{onClose();window.dispatchEvent(new CustomEvent('wg-warden-config',{detail:result}))},onError:e=>setError(e.message)})
-  return <div className="overlay"><section className="dialog panel"><button className="close" onClick={onClose}>×</button><div className="eyebrow">PEER / EDIT</div><h2>Edit {peer.name}</h2><div className="form-stack"><label>Device name<input value={name} onChange={e=>setName(e.target.value)} maxLength={100}/></label><label>Client private key<input type="password" value={privateKey} onChange={e=>setPrivateKey(e.target.value)} placeholder="Stored encrypted; required to reopen the config"/></label></div>{error&&<div className="form-error">{error}</div>}<div className="dialog-actions"><button className="button quiet" onClick={onClose}>Cancel</button><button className="button quiet" disabled={config.isPending} onClick={()=>config.mutate()}>Get config</button><button className="button primary" disabled={save.isPending||!name.trim()} onClick={()=>save.mutate()}>Save</button></div></section></div>
+
+  function submit(e:FormEvent){
+    e.preventDefault()
+    const trimmedName=name.trim()
+    if(!trimmedName){setError('Peer name cannot be blank');return}
+    const trafficLimitBytes=trafficGb.trim()?Math.round(Number(trafficGb)*1024*1024*1024):null
+    const clearTrafficLimit=!trafficGb.trim()
+    const expiresAtIso=durationDays.trim()?new Date(Date.now()+Number(durationDays)*86400000).toISOString():null
+    const clearExpiresAt=!durationDays.trim()
+
+    setError('')
+    save.mutate({name:trimmedName,enabled,privateKey:privateKey.trim()||undefined,trafficLimitBytes,clearTrafficLimit,expiresAt:expiresAtIso,clearExpiresAt})
+  }
+
+  return <div className="overlay" onMouseDown={e=>e.target===e.currentTarget&&onClose()}><section className="dialog panel"><button className="close" onClick={onClose}>×</button><div className="eyebrow">PEER / EDIT</div><h2>Edit {peer.name}</h2><p className="dialog-copy">Update name, limits or private key. When limits are reached, the peer is disabled and can be extended here.</p><form onSubmit={submit} className="form-stack"><label>Device name<input value={name} onChange={e=>setName(e.target.value)} maxLength={100} required/></label><div className="field-row"><label>Traffic limit (GB)<input type="number" step="0.1" value={trafficGb} onChange={e=>setTrafficGb(e.target.value)} placeholder="Unlimited"/></label><label>Usage limit (days)<input type="number" step="1" value={durationDays} onChange={e=>{setDurationDays(e.target.value);if(!enabled&&e.target.value)setEnabled(true)}} placeholder="Unlimited"/></label></div><label>Client private key<input type="text" autoComplete="off" value={privateKey} onChange={e=>setPrivateKey(e.target.value)} placeholder="Stored encrypted; required to reopen the config"/></label><label className="checkbox-label"><input type="checkbox" checked={enabled} onChange={e=>setEnabled(e.target.checked)}/> Enable peer (allow connection)</label>{error&&<div className="form-error">{error}</div>}<div className="dialog-actions"><button type="button" className="button quiet" onClick={onClose}>Cancel</button><button type="button" className="button quiet" disabled={config.isPending} onClick={()=>config.mutate()}>Get config</button><button className="button primary" disabled={save.isPending||!name.trim()}>{save.isPending?<><span className="spinner"/> Saving…</>:'Save'}</button></div></form></section></div>
 }
 
 function PeerRow({peer,token,selected,onSelect,disabled,onChanged,onEdit,onRequestDelete}:{peer:Peer;token:string;selected:boolean;onSelect:()=>void;disabled:boolean;onChanged:()=>void;onEdit:()=>void;onRequestDelete:(action:()=>void)=>void}){
@@ -205,7 +241,7 @@ function PeerRow({peer,token,selected,onSelect,disabled,onChanged,onEdit,onReque
   const config=useMutation({mutationFn:()=>api<PeerCreated>(`/api/peers/${peer.id}/config`,token),onSuccess:result=>window.dispatchEvent(new CustomEvent('wg-warden-config',{detail:result})),onError:e=>setError(e.message)})
   const state=disabled||!peer.enabled?'OFFLINE':metrics.isError?'UNAVAILABLE':metrics.isLoading?'CHECKING':latest?.online?'ONLINE':'OFFLINE'
   return <>
-    <tr className={selected?'selected':''} onClick={onSelect}><td><strong>{peer.name}</strong><small className="mono">{peer.publicKey.slice(0,16)}…</small>{peerLimits(peer)&&<small className="limit-note">{peerLimits(peer)}</small>}</td><td className="mono">{peer.allowedIp}</td><td><span className={`peer-state ${state.toLowerCase()}`}><i/>{state}</span></td><td>{metrics.isError?<span className="error-text">Unavailable</span>:metrics.isLoading?'Loading…':dateTime(latest?.lastHandshake??null)}</td><td className="mono traffic">↓ {bytes(latest?.rxBytes??0)}<br/>↑ {bytes(latest?.txBytes??0)}</td><td className="actions"><button disabled={disabled} onClick={e=>{e.stopPropagation();onEdit()}}>EDIT</button>{peer.configAvailable&&<button disabled={disabled||config.isPending} onClick={e=>{e.stopPropagation();config.mutate()}}>CONF</button>}<button disabled={disabled||toggle.isPending} title={peer.enabled?'Disable peer':'Enable peer'} onClick={e=>{e.stopPropagation();setError('');toggle.mutate()}}>{peer.enabled?'DISABLE':'ENABLE'}</button><button className="danger" disabled={disabled||remove.isPending} title="Delete peer" onClick={e=>{e.stopPropagation();onRequestDelete(()=>{setError('');remove.mutate()})}}>DELETE</button></td></tr>
+    <tr className={selected?'selected':''} onClick={onSelect}><td><strong>{peer.name}</strong><small className="mono">{peer.publicKey.slice(0,16)}…</small>{peerLimits(peer)&&<small className="limit-note">{peerLimits(peer)}</small>}</td><td className="mono">{peer.allowedIp}</td><td><span className={`peer-state ${state.toLowerCase()}`}><i/>{state}</span></td><td>{metrics.isError?<span className="error-text">Unavailable</span>:metrics.isLoading?'Loading…':dateTime(latest?.lastHandshake??null)}</td><td className="mono traffic">↓ {bytes(latest?.rxBytes??0)}<br/>↑ {bytes(latest?.txBytes??0)}</td><td className="actions"><button disabled={disabled} onClick={e=>{e.stopPropagation();onEdit()}}>EDIT</button>{peer.configAvailable&&<button disabled={disabled||config.isPending} onClick={e=>{e.stopPropagation();config.mutate()}}>CONF</button>}{(()=>{const timeExpired=!peer.enabled&&!!peer.expiresAt&&new Date(peer.expiresAt).getTime()<=Date.now();const trafficExpired=!peer.enabled&&!!peer.trafficLimitBytes&&!!latest&&(latest.rxBytes+latest.txBytes)>=peer.trafficLimitBytes;const limitExpired=timeExpired||trafficExpired;return <button disabled={disabled||toggle.isPending||(!peer.enabled&&limitExpired)} title={limitExpired&&!peer.enabled?'Limit expired — edit limits to re-enable':peer.enabled?'Disable peer':'Enable peer'} onClick={e=>{e.stopPropagation();setError('');toggle.mutate()}}>{peer.enabled?'DISABLE':'ENABLE'}</button>})()}<button className="danger" disabled={disabled||remove.isPending} title="Delete peer" onClick={e=>{e.stopPropagation();onRequestDelete(()=>{setError('');remove.mutate()})}}>DELETE</button></td></tr>
     {error&&<tr><td colSpan={6} className="row-error">{error}</td></tr>}
   </>
 }
@@ -223,5 +259,5 @@ function ConfigDialog({result,onClose}:{result:PeerCreated;onClose:()=>void}){
   const [copied,setCopied]=useState(false)
   const download=()=>{const link=document.createElement('a');link.href=URL.createObjectURL(new Blob([result.config],{type:'text/plain'}));link.download=`${result.peer.name.replace(/[^\p{L}\p{N}_-]/gu,'_')}.conf`;link.click();URL.revokeObjectURL(link.href)}
   async function copy(){await navigator.clipboard.writeText(result.config);setCopied(true);setTimeout(()=>setCopied(false),1800)}
-  return <div className="overlay"><section className="dialog config-dialog panel"><button className="close" onClick={onClose}>×</button><div className="eyebrow">ONE-TIME SECRET / PEER</div><h2>Peer config created</h2><p className="dialog-copy">This config contains a private key and is shown once. Save the file or scan the QR now. Keys you import explicitly are stored encrypted so their config can be reopened.</p><div className="qr-wrap"><img src={`data:image/png;base64,${result.qrCodePngBase64}`} alt="WireGuard peer QR code"/><div><strong>{result.peer.name}</strong><code>{result.peer.allowedIp}</code><small>Private key is included in the QR and config.</small></div></div><textarea className="config-output" readOnly rows={9} value={result.config}/><div className="dialog-actions"><button className="button quiet" onClick={copy}>{copied?'Copied':'Copy config'}</button><button className="button primary" onClick={download}>Download .conf</button><button className="button quiet" onClick={onClose}>Close</button></div></section></div>
+  return <div className="overlay"><section className="dialog config-dialog panel"><button className="close" onClick={onClose}>×</button><div className="eyebrow">ONE-TIME SECRET / PEER</div><h2>Peer config created</h2><p className="dialog-copy">This config contains a private key and is shown once. Save the file or scan the QR now. Keys you import explicitly are stored encrypted so their config can be reopened.</p><div className="qr-wrap"><img src={`data:image/png;base64,${result.qrCodePngBase64}`} alt="WireGuard peer QR code"/><div><strong>{result.peer.name}</strong><code>{result.peer.allowedIp}</code><small>Private key is included in the QR and config.</small></div></div><textarea className="config-output" readOnly rows={9} style={{resize:'none'}} value={result.config}/><div className="dialog-actions"><button className="button quiet" onClick={copy}>{copied?'Copied':'Copy config'}</button><button className="button primary" onClick={download}>Download .conf</button><button className="button quiet" onClick={onClose}>Close</button></div></section></div>
 }
