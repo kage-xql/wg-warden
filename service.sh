@@ -26,6 +26,13 @@ case "$action" in
     docker compose stop
     echo "wg-warden выключен. Данные сохранены."
     ;;
+  restart)
+    # --force-recreate применяет изменения в .env
+    docker compose up -d --force-recreate
+    web_port="$(sed -n 's/^WEB_PORT=//p' .env | tail -n 1)"
+    web_port="${web_port:-8080}"
+    echo "wg-warden применён: http://localhost:${web_port}"
+    ;;
   status)
     docker compose ps
     ;;
@@ -33,7 +40,7 @@ case "$action" in
     docker compose logs -f
     ;;
   *)
-    echo "Использование: ./service.sh {start|stop|status|logs}"
+    echo "Использование: ./service.sh {start|stop|restart|status|logs}"
     exit 2
     ;;
 esac

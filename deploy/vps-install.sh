@@ -20,6 +20,46 @@ env_value() {
   sed -n "s|^$1=||p" "$ENV_FILE" | tail -n 1
 }
 
+set_env_value() {
+  local key="$1" value="$2"
+  if grep -q "^${key}=" "$ENV_FILE"; then
+    sed -i.bak "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
+    rm -f "$ENV_FILE.bak"
+  else
+    printf '\n%s=%s\n' "$key" "$value" >> "$ENV_FILE"
+  fi
+}
+
+# Принимает домен в виде example.com, https://example.com/ или 203.0.113.10.
+normalize_domain() {
+  local value="$1"
+  value="${value// /}"
+  value="${value#http://}"
+  value="${value#https://}"
+  value="${value%%/*}"
+  value="${value%:443}"
+  value="${value%:80}"
+  value="${value%.}"
+  printf '%s' "${value,,}"
+}
+
+is_ipv4() {
+  local value="$1" octet
+  [[ "$value" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for octet in "${BASH_REMATCH[@]:1}"; do
+    [ "$octet" -le 255 ] || return 1
+  done
+  return 0
+}
+
+is_hostname() {
+  local value="$1"
+  [ "${#value}" -ge 1 ] && [ "${#value}" -le 253 ] || return 1
+  [[ "$value" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || return 1
+  [[ "$value" != *..* ]] || return 1
+  return 0
+}
+
 compose() {
   docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
 }
@@ -97,22 +137,56 @@ bootstrap_token="$(env_value APP_BOOTSTRAP_TOKEN)"
 
 web_port="$(env_value WEB_PORT)"
 web_port="${web_port:-80}"
-app_domain="$(env_value APP_DOMAIN)"
-app_domain="${app_domain// /}"
+raw_domain="$(env_value APP_DOMAIN)"
+app_domain="$(normalize_domain "$raw_domain")"
+raw_tls_mode="$(env_value TLS_MODE)"
+tls_mode="${raw_tls_mode:-acme}"
+tls_mode="${tls_mode,,}"
 
 if [ -n "$app_domain" ]; then
-  COMPOSE_FILE="docker-compose.tls.yml"
-  tls_mode="$(env_value TLS_MODE)"
-  tls_mode="${tls_mode:-acme}"
-  http_port="$(env_value HTTP_PORT)"
-  http_port="${http_port:-80}"
-  https_port="$(env_value HTTPS_PORT)"
-  https_port="${https_port:-443}"
+  # Сначала проверяем значения и только потом пишем их в .env.vps:
+  # иначе битое значение останется в файле и сломает следующий запуск.
+  if [[ "$app_domain" == *:* ]]; then
+    die "APP_DOMAIN не должен содержать IPv6 или порт. Укажите домен или IPv4-адрес без схемы и слэшей."
+  fi
+  ip_internal=0
+  if is_ipv4 "$app_domain"; then
+    if [ "$tls_mode" != "internal" ]; then
+      tls_mode="internal"
+      ip_internal=1
+    fi
+  elif ! is_hostname "$app_domain"; then
+    die "APP_DOMAIN должен быть доменом (panel.example.com) или IPv4-адресом, без http:// и слэшей (сейчас: ${app_domain:-<пусто>})"
+  fi
   case "$tls_mode" in
     acme|internal) ;;
     *) die "TLS_MODE должен быть acme или internal (сейчас: $tls_mode)" ;;
   esac
+
+  if [ "$raw_domain" != "$app_domain" ]; then
+    set_env_value APP_DOMAIN "$app_domain"
+    say "APP_DOMAIN приведён к виду ${app_domain}"
+  fi
+  if [ "$raw_tls_mode" != "$tls_mode" ]; then
+    set_env_value TLS_MODE "$tls_mode"
+    if [ "$ip_internal" -eq 1 ]; then
+      say "APP_DOMAIN — IP-адрес: Let's Encrypt не выдаёт сертификаты на IP, включаю TLS_MODE=internal"
+    else
+      say "TLS_MODE приведён к ${tls_mode}"
+    fi
+  fi
+
+  COMPOSE_FILE="docker-compose.tls.yml"
+  http_port="$(env_value HTTP_PORT)"
+  http_port="${http_port:-80}"
+  https_port="$(env_value HTTPS_PORT)"
+  https_port="${https_port:-443}"
+  [[ "$http_port" =~ ^[0-9]+$ ]] || die "HTTP_PORT должен быть числом"
+  [[ "$https_port" =~ ^[0-9]+$ ]] || die "HTTPS_PORT должен быть числом"
   [ -f "deploy/Caddyfile.${tls_mode}" ] || die "не найден deploy/Caddyfile.${tls_mode}"
+  if [ "$tls_mode" = "acme" ] && [ "$http_port" != "80" ]; then
+    say "Внимание: Let's Encrypt проверяет домен через порт 80. При HTTP_PORT=${http_port} сертификат не выпустится, пока порт 80 не будет свободен."
+  fi
   say "Домен ${app_domain}: панель пойдёт по HTTPS (режим сертификата: ${tls_mode})"
 
   if [ "$tls_mode" = "acme" ]; then
@@ -131,22 +205,39 @@ else
 fi
 
 # Собираем последовательно: на слабом VPS параллельная сборка Maven и Node упирается в память.
+free_kb="$(df -Pk / | awk 'NR==2 {print $4}')"
+if [ "${free_kb:-0}" -gt 0 ] && [ "${free_kb:-0}" -lt 3145728 ]; then
+  say "Внимание: меньше 3 ГБ свободного места, сборка может упасть. Освободите диск (df -h)."
+fi
 say "Собираю образы (на VPS с 1 ГБ RAM это может занять 5–15 минут)"
-compose build app
-compose build web
+if ! compose build app; then
+  die "не удалось собрать backend-образ. Проверьте вывод Docker, свободное место (df -h) и память (free -h)."
+fi
+if ! compose build web; then
+  die "не удалось собрать frontend-образ. Проверьте вывод Docker, свободное место (df -h) и память (free -h)."
+fi
+
+# При смене режима (HTTP ↔ HTTPS) compose создаёт другую сеть. Если сначала
+# удалить старую сеть, запущенные контейнеры останутся без неё и up упадёт.
+# Поэтому сначала штатно останавливаем контейнеры проекта, затем поднимаем новые.
+say "Останавливаю контейнеры предыдущего стека (если были)"
+compose down --remove-orphans >/dev/null 2>&1 || true
 
 say "Запускаю контейнеры"
-compose up -d --remove-orphans
+if ! compose up -d --remove-orphans; then
+  compose ps >&2 || true
+  die "не удалось запустить контейнеры. Логи: ./deploy/vps-service.sh logs"
+fi
 
 say "Ожидаю готовности приложения"
 healthy=0
 for _ in $(seq 1 60); do
   if [ -n "$app_domain" ]; then
-    probe=(curl -fsS --resolve "${app_domain}:${https_port}:127.0.0.1")
+    probe=(curl -fsS --max-time 5 --resolve "${app_domain}:${https_port}:127.0.0.1")
     [ "$tls_mode" = "internal" ] && probe+=(-k)
     probe+=("https://${app_domain}:${https_port}/actuator/health")
   else
-    probe=(curl -fsS "http://127.0.0.1:${web_port}/actuator/health")
+    probe=(curl -fsS --max-time 5 "http://127.0.0.1:${web_port}/actuator/health")
   fi
   if "${probe[@]}" >/dev/null 2>&1; then
     healthy=1
@@ -158,9 +249,9 @@ done
 if [ "$healthy" -ne 1 ]; then
   docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" ps >&2 || true
   if [ -n "$app_domain" ] && [ "$tls_mode" = "acme" ]; then
-    die "приложение не ответило за 3 минуты. Если порт 80 закрыт или A-запись неверна, сертификат не выпустится. Логи: ./deploy/vps-service.sh logs"
+    die "приложение не ответило за отведённое время. Если порт 80 закрыт или A-запись неверна, сертификат не выпустится. Логи: ./deploy/vps-service.sh logs"
   fi
-  die "приложение не ответило за 3 минуты. Логи: ./deploy/vps-service.sh logs"
+  die "приложение не ответило за отведённое время. Логи: ./deploy/vps-service.sh logs"
 fi
 
 if [ -n "$app_domain" ]; then
@@ -202,6 +293,8 @@ if [ -z "$app_domain" ]; then
   cat <<'HINT'
 
 Доступ по IP идёт по HTTP, без TLS: логин и токен передаются открыто.
-Для постоянной работы укажите домен в APP_DOMAIN и запустите установку снова.
+Для постоянной работы включите HTTPS и запустите ./deploy/vps-install.sh снова:
+  APP_DOMAIN=panel.example.com, TLS_MODE=acme     — домен и сертификат Let's Encrypt
+  APP_DOMAIN=<IP-VPS>, TLS_MODE=internal          — IP и самоподписанный сертификат
 HINT
 fi

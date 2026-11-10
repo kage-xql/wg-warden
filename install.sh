@@ -14,6 +14,11 @@ if ! command -v openssl >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v curl >/dev/null 2>&1; then
+  echo "Ошибка: curl не найден; он нужен для проверки готовности приложения."
+  exit 1
+fi
+
 if ! docker compose version >/dev/null 2>&1; then
   echo "Ошибка: требуется Docker Compose v2 (команда 'docker compose')."
   exit 1
@@ -73,13 +78,18 @@ legacy_containers="$(docker compose -p wg-manager ps -q -a)"
 if [ -n "$legacy_containers" ]; then
   docker compose -p wg-manager down
 fi
-docker compose up -d --build
+if ! docker compose up -d --build; then
+  echo
+  echo "Ошибка: не удалось запустить контейнеры."
+  echo "Проверьте свободное место (df -h), память (free -h) и логи: docker compose logs"
+  exit 1
+fi
 
 web_port="$(sed -n 's/^WEB_PORT=//p' .env | tail -n 1)"
 web_port="${web_port:-8080}"
 echo "Ожидаю готовности приложения..."
-for attempt in $(seq 1 30); do
-  if curl -fsS "http://localhost:${web_port}/actuator/health" >/dev/null 2>&1; then
+for attempt in $(seq 1 60); do
+  if curl -fsS --max-time 5 "http://localhost:${web_port}/actuator/health" >/dev/null 2>&1; then
     echo
     echo "wg-warden запущен: http://localhost:${web_port}"
     echo

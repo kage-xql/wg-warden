@@ -13,6 +13,7 @@ wg-warden запускается локально через Docker Compose ил
 - [Быстрый старт: локальный запуск](#быстрый-старт-локальный-запуск)
 - [Установка на VPS](#установка-на-vps)
 - [Подключение управляемого VPS](#подключение-управляемого-vps)
+- [Устранение неполадок](#устранение-неполадок)
 - [Настройки](#настройки)
 - [Резервные копии](#резервные-копии)
 - [Разработка](#разработка)
@@ -44,7 +45,7 @@ wg-warden запускается локально через Docker Compose ил
 ## Как это устроено
 
 ```text
-Браузер → [Caddy: HTTPS, только на VPS с доменом] → Nginx / React → Spring Boot API → PostgreSQL
+Браузер → [Caddy: HTTPS на VPS] → Nginx / React → Spring Boot API → PostgreSQL
                                                                            │
                                                                            └── SSH → ваш VPS с Ubuntu или Debian
 ```
@@ -89,6 +90,7 @@ cd wg-warden
 ```bash
 ./service.sh start     # запустить
 ./service.sh stop      # остановить
+./service.sh restart   # применить изменения из .env
 ./service.sh status    # проверить состояние
 ./service.sh logs      # посмотреть логи
 ```
@@ -106,24 +108,25 @@ git pull
 
 Панель можно поднять на собственном сервере. Это удобно, когда нужен постоянный мониторинг и доступ с любых устройств. Локальный запуск при этом не затрагивается.
 
-| Режим | Файл | Доступ | Когда подходит |
+| Режим | Что заполнить в `.env.vps` | Адрес панели | Когда подходит |
 | --- | --- | --- | --- |
-| **С доменом** (рекомендуется) | `docker-compose.tls.yml` | `https://ваш-домен` | постоянная работа |
-| **По IP** | `docker-compose.vps.yml` | `http://<IP>` | проверка и временный доступ |
+| **HTTPS с доменом** (рекомендуется) | `APP_DOMAIN=panel.example.com`, `TLS_MODE=acme` | `https://panel.example.com` | постоянная работа |
+| **HTTPS по IP** | `APP_DOMAIN=203.0.113.10`, `TLS_MODE=internal` | `https://203.0.113.10` + предупреждение браузера | нет домена, но нужен шифрованный канал |
+| **HTTP по IP** | `APP_DOMAIN=` (пусто) | `http://203.0.113.10` | только проверка, трафик не шифруется |
 
-Режим выбирается автоматически: если в `.env.vps` заполнен `APP_DOMAIN`, поднимается HTTPS через Caddy, если пуст, панель доступна по IP.
-
-В обоих режимах PostgreSQL доступен только внутри Docker-сети, контейнерам заданы лимиты памяти, а размер логов ограничен.
+Режим выбирается автоматически по `APP_DOMAIN`: пусто — HTTP-стек `docker-compose.vps.yml`, заполнено — HTTPS-стек `docker-compose.tls.yml` с Caddy. Для IP-адреса установщик сам включает `TLS_MODE=internal`: Let's Encrypt не выдаёт сертификаты на IP.
 
 > [!WARNING]
-> В режиме «по IP» трафик не шифруется. В открытом виде передаются пароль панели, JWT и всё, что вы вводите в форме: SSH-пароли и приватные ключи серверов, а также клиентские профили WireGuard. Используйте его только для проверки, а для постоянной работы подключите домен.
+> В режиме «HTTP по IP» трафик не шифруется. В открытом виде передаются пароль панели, JWT и всё, что вы вводите в форме: SSH-пароли и приватные ключи серверов, а также клиентские профили WireGuard. Используйте его только для проверки, а для постоянной работы включите HTTPS.
+
+Во всех режимах PostgreSQL доступен только внутри Docker-сети, контейнерам заданы лимиты памяти, а размер логов ограничен.
 
 ### Требования
 
-- Ubuntu 22.04/24.04 или Debian 12, 1 ГБ RAM (лучше 2 ГБ), 10 ГБ диска.
-- Открытые порты: SSH и 80/443 для HTTPS (или только 80 для доступа по IP).
-- Для HTTPS: домен или поддомен с A-записью на IP этого VPS.
-- Docker установщик поставит сам.
+- Ubuntu 22.04/24.04 или Debian 12; 1 ГБ RAM (лучше 2 ГБ), 10 ГБ диска и минимум 3 ГБ свободно под образы.
+- Открытые порты: SSH и 80/443 для HTTPS (или только 80 для HTTP-доступа по IP).
+- Для HTTPS с доменом: домен или поддомен с A-записью на IP этого VPS.
+- Docker и Compose v2 установщик поставит сам.
 
 ### 1. Подготовка чистого сервера
 
@@ -144,7 +147,7 @@ rsync --archive --chown=wgwarden:wgwarden ~/.ssh /home/wgwarden
 
 ```bash
 sudo apt update && sudo apt full-upgrade -y
-sudo apt install -y curl git ca-certificates ufw
+sudo apt install -y curl git ca-certificates openssl ufw
 ```
 
 **Firewall.** Наружу нужны только SSH и порты панели. Порты PostgreSQL (`5432`) и backend (`8081`) не публикуются, открывать их не надо.
@@ -152,7 +155,8 @@ sudo apt install -y curl git ca-certificates ufw
 ```bash
 sudo ufw allow OpenSSH
 sudo ufw allow 80/tcp     # HTTP: проверка домена и редирект на HTTPS
-sudo ufw allow 443/tcp    # HTTPS (только при использовании домена)
+sudo ufw allow 443/tcp    # HTTPS
+sudo ufw allow 443/udp    # HTTP/3, необязательно
 sudo ufw enable
 sudo ufw status
 ```
@@ -183,23 +187,92 @@ cd wg-warden
 
 Скрипт установит Docker (если его нет), создаст swap при необходимости, сгенерирует секреты в `.env.vps`, последовательно соберёт образы и дождётся health-check. На слабом VPS первая сборка занимает 5-15 минут. В конце скрипт напечатает адрес панели.
 
-Если порт 80 занят, задайте в `.env.vps` `WEB_PORT=8080` и запустите установку снова.
+Если порт 80 занят: в режиме HTTP по IP задайте `WEB_PORT=8080`, в режиме HTTPS — `HTTP_PORT` и `HTTPS_PORT`. После правки запустите установку снова.
 
-### 3. HTTPS с доменом
+### 3. Включите HTTPS
 
-1. Направьте A-запись домена на IP сервера и дождитесь, пока она начнёт резолвиться: `dig +short panel.example.com`.
-2. Укажите домен и запустите установку ещё раз:
+#### Вариант A — домен с Let's Encrypt (рекомендуется)
+
+1. Направьте A-запись домена на IP сервера и дождитесь, пока она начнёт резолвиться:
 
 ```bash
+dig +short panel.example.com     # должен вернуть IP этого VPS
+```
+
+2. Откройте порты в `ufw` и у провайдера (DigitalOcean Cloud Firewall, Security Group и т. п.):
+
+```bash
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw allow 443/udp    # HTTP/3, необязательно
+```
+
+3. Укажите домен и перезапустите установку:
+
+```bash
+cd ~/wg-warden
+
 sed -i 's|^APP_DOMAIN=.*|APP_DOMAIN=panel.example.com|' .env.vps
+grep -q '^APP_DOMAIN=' .env.vps || echo 'APP_DOMAIN=panel.example.com' >> .env.vps
+
+sed -i 's|^TLS_MODE=.*|TLS_MODE=acme|' .env.vps
+grep -q '^TLS_MODE=' .env.vps || echo 'TLS_MODE=acme' >> .env.vps
+
 ./deploy/vps-install.sh
 ```
 
-Caddy сам выпустит сертификат Let's Encrypt и будет его продлевать, а HTTP-запросы будут перенаправляться на HTTPS. Сертификаты лежат в Docker volume `wg-warden_caddy_data` и переживают перезапуск контейнеров. Порты 80 и 443 должны быть открыты и в firewall провайдера.
+Caddy выпустит сертификат Let's Encrypt и будет его продлевать, HTTP-запросы перенаправятся на HTTPS. Сертификаты лежат в volume `wg-warden_caddy_data` и переживают перезапуск контейнеров.
 
-Порты Caddy меняются через `HTTP_PORT` и `HTTPS_PORT`, но с Let's Encrypt их лучше не трогать: проверка домена идёт через порт 80. Чтобы сменить домен, поменяйте `APP_DOMAIN` и запустите установку снова.
+#### Вариант B — HTTPS по IP (самоподписанный)
 
-Шифрование без домена возможно: задайте `APP_DOMAIN=<IP-VPS>` и `TLS_MODE=internal`. Caddy выпустит самоподписанный сертификат, трафик будет зашифрован, но браузер покажет предупреждение о недоверенном сертификате.
+Подходит, если домена нет, но пароль и SSH-ключи нельзя гонять открытым текстом. Браузер покажет предупреждение о недоверенном сертификате — трафик при этом шифруется.
+
+```bash
+cd ~/wg-warden
+
+IP="$(curl -fsS --max-time 5 https://api.ipify.org)"
+sed -i "s|^APP_DOMAIN=.*|APP_DOMAIN=${IP}|" .env.vps
+grep -q '^APP_DOMAIN=' .env.vps || echo "APP_DOMAIN=${IP}" >> .env.vps
+
+sed -i 's|^TLS_MODE=.*|TLS_MODE=internal|' .env.vps
+grep -q '^TLS_MODE=' .env.vps || echo 'TLS_MODE=internal' >> .env.vps
+
+./deploy/vps-install.sh
+```
+
+Открывайте `https://<IP>`, в предупреждении браузера — «Дополнительно → Перейти на сайт». Чтобы убрать предупреждение, можно вытащить корневой сертификат Caddy и установить его на свои устройства:
+
+```bash
+docker compose -f docker-compose.tls.yml --env-file .env.vps \
+  exec caddy cat /data/caddy/pki/authorities/local/root.crt > caddy-root.crt
+```
+
+#### Переключение между HTTP и HTTPS
+
+Установщик сам останавливает контейнеры предыдущего стека перед запуском нового — вручную удалять контейнеры не нужно. Достаточно поменять `APP_DOMAIN`/`TLS_MODE` в `.env.vps` и выполнить:
+
+```bash
+./deploy/vps-install.sh
+```
+
+Если на старой версии возникла ошибка `could not find a network matching network mode wg-warden_default`, сначала удалите контейнеры старого стека, затем повторите установку:
+
+```bash
+docker compose -f docker-compose.tls.yml --env-file .env.vps down --remove-orphans || true
+./deploy/vps-install.sh
+```
+
+#### Проверка после установки
+
+```bash
+# health через HTTPS (для самоподписанного сертификата нужен -k)
+curl -k -sS https://<IP-или-домен>/actuator/health
+# {"status":"UP"}
+
+# состояние контейнеров и логи Caddy
+./deploy/vps-service.sh status
+docker compose -f docker-compose.tls.yml --env-file .env.vps logs --tail=100 caddy
+```
 
 ### 4. Первая регистрация
 
@@ -215,7 +288,9 @@ Caddy сам выпустит сертификат Let's Encrypt и будет �
 git pull && ./deploy/vps-install.sh     # обновление
 ```
 
-`restart` пересоздаёт контейнеры с текущими значениями из `.env.vps` и переключает стек, если `APP_DOMAIN` появился или изменился. Перед обновлением рекомендуется сделать резервную копию.
+`restart` пересоздаёт контейнеры с текущими значениями из `.env.vps` и сам переключает стек, если `APP_DOMAIN` появился или изменился. `APP_DOMAIN` можно писать как `panel.example.com`, `https://panel.example.com/` или `203.0.113.10` — установщик приведёт значение к нужному виду. Перед обновлением рекомендуется сделать резервную копию.
+
+Если обновление меняет правила WireGuard на управляемых серверах (например, forwarding и firewall), после `git pull` нажмите **Provision WireGuard** у каждого сервера: сама панель конфиг на VPS не переписывает.
 
 ### Особенности VPS-стека
 
@@ -241,28 +316,102 @@ git pull && ./deploy/vps-install.sh     # обновление
 
 Варианты:
 
-- **Для теста:** добавлять сервер под `root` с SSH-ключом (в Ubuntu `PermitRootLogin prohibit-password` разрешает вход по ключу).
-- **Рекомендуется:** отдельный пользователь с sudo без пароля. На управляемом VPS:
+- **Для быстрого теста:** добавить сервер под `root` с SSH-ключом (в Ubuntu `PermitRootLogin prohibit-password` разрешает вход по ключу). Проще всего, но root-ключ от VPS будет храниться в панели.
+- **Для постоянной работы (рекомендуется):** отдельный пользователь с sudo без пароля. Root-вход по SSH можно полностью закрыть.
+
+Панель отправляет на сервер целый bash-скрипт (`sudo -n bash -s`), поэтому ограничить sudo списком команд (`wg`, `systemctl`, `apt-get`) не получится: пришлось бы разрешить `bash`, а это всё равно полный root. Используйте `NOPASSWD: ALL` — но с отдельным пользователем и отдельным ключом.
+
+На управляемом VPS:
 
 ```bash
-echo 'deploy ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/wg-warden
+sudo adduser wgwarden
+sudo usermod -aG sudo wgwarden
+
+# отдельный ключ именно для панели
+sudo install -d -m 700 -o wgwarden -g wgwarden /home/wgwarden/.ssh
+echo 'ssh-ed25519 AAAA...публичный-ключ-панели... panel' | sudo tee /home/wgwarden/.ssh/authorized_keys
+sudo chown wgwarden:wgwarden /home/wgwarden/.ssh/authorized_keys
+sudo chmod 600 /home/wgwarden/.ssh/authorized_keys
+
+echo 'wgwarden ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/wg-warden
 sudo chmod 440 /etc/sudoers.d/wg-warden
-sudo visudo -c                              # проверить синтаксис
-sudo -n true && echo "sudo -n работает"     # выполнять от имени этого пользователя
+sudo visudo -c
+
+# проверка от имени этого пользователя
+sudo -u wgwarden sudo -n true && echo "sudo -n работает"
 ```
 
-Для постоянной работы замените `ALL` на список нужных команд (`wg`, `wg-quick`, `systemctl`, `apt-get`, `tee` и т. д.).
+В панели укажите пользователя `wgwarden`, SSH-порт и приватный ключ. После успешного подключения можно закрыть прямой root-вход:
 
-### Порт WireGuard
-
-Интерфейс `wg-warden0` поднимается на UDP-порту `51821`. Если на управляемом VPS включён `ufw`, установка сама добавит правило `ufw allow 51821/udp`. Проверка:
+```text
+# /etc/ssh/sshd_config.d/99-hardening.conf
+PermitRootLogin no
+PasswordAuthentication no
+```
 
 ```bash
-sudo ufw status | grep 51821
+sudo systemctl reload ssh
+```
+
+### Порт WireGuard и forwarding
+
+Интерфейс `wg-warden0` поднимается на UDP-порту `51821`. Provisioning сам:
+
+- ставит `wireguard` и `iptables`, если их нет;
+- включает `net.ipv4.ip_forward=1`;
+- добавляет NAT (`MASQUERADE`) для подсети `10.67.0.0/24`;
+- разрешает forwarding `wg-warden0 → внешний интерфейс` и обратно.
+
+Правила forwarding нужны потому, что Docker и `ufw` по умолчанию ставят политику `FORWARD = DROP`. Без них handshake проходит, а интернета у клиента нет.
+
+Проверка на управляемом VPS:
+
+```bash
 sudo wg show
+sudo sysctl net.ipv4.ip_forward          # должно быть 1
+sudo iptables -S FORWARD | head
+sudo iptables -t nat -S POSTROUTING | grep 10.67
+sudo ufw status | grep 51821
 ```
 
 Если у провайдера есть внешний firewall (Security Group, Cloud Firewall), откройте там входящий UDP 51821. Без открытого порта клиент подключается, но handshake не проходит.
+
+Если handshake есть, а сайты не открываются: проверьте, что в `FORWARD` есть правила для `wg-warden0`, и повторно нажмите **Provision WireGuard** — новые версии панели применяют правила идемпотентно, в том числе к уже запущенному интерфейсу.
+
+## Устранение неполадок
+
+### Панель не открывается или не запускается
+
+| Симптом | Причина | Что сделать |
+| --- | --- | --- |
+| `tlsv1 alert internal error`, `ERR_SSL_PROTOCOL_ERROR` на `https://<IP>` | Клиент не отправляет SNI при подключении по IP, Caddy не может выбрать сертификат | Убедиться, что в `deploy/Caddyfile.internal` есть `default_sni {$APP_DOMAIN}` (в актуальной версии есть), затем: `docker compose -f docker-compose.tls.yml --env-file .env.vps restart caddy` |
+| `could not find a network matching network mode wg-warden_default` | Переключение HTTP ↔ HTTPS: Compose удалил старую сеть раньше контейнеров | `docker compose -f docker-compose.tls.yml --env-file .env.vps down --remove-orphans` и снова `./deploy/vps-install.sh`. Новый установщик делает это сам |
+| `port is already allocated` для 80/443 | Старый стек или другой сервис держит порт | `docker ps`, затем `./deploy/vps-service.sh stop` и `./deploy/vps-install.sh`; проверьте `sudo ss -ltnp \| grep -E ':80\|:443'` |
+| Let's Encrypt не выпускает сертификат | Нет A-записи, закрыт 80/tcp, мешает прокси Cloudflare | `dig +short panel.example.com`; откройте 80/tcp в ufw и у провайдера; логи Caddy: `docker compose -f docker-compose.tls.yml --env-file .env.vps logs --tail=100 caddy` |
+| `Container wg-warden-app is unhealthy` | Не хватает RAM/swap, упала БД, ошибка в конфиге | `free -h`, `df -h`, `docker compose -f docker-compose.tls.yml --env-file .env.vps logs --tail=200 app db` |
+| Панель открывается, но API отвечает 502 | Backend не поднялся или не прошёл health-check | `./deploy/vps-service.sh status`; логи `app`; дождитесь окончания старта |
+| После смены `APP_DOMAIN` адрес прежний | Не применён новый стек | `./deploy/vps-service.sh restart` или `./deploy/vps-install.sh` |
+| Забыли setup-токен первого аккаунта | — | `grep '^APP_BOOTSTRAP_TOKEN=' .env.vps` |
+
+Все логи разом:
+
+```bash
+./deploy/vps-service.sh logs
+# или конкретный сервис
+docker compose -f docker-compose.tls.yml --env-file .env.vps logs -f caddy
+```
+
+### Ошибки при добавлении и провижионинге сервера
+
+| Симптом | Причина | Что сделать |
+| --- | --- | --- |
+| `Server connection failed` / `sudo: a password is required` | У SSH-пользователя sudo с паролем | Настройте `NOPASSWD` (см. [Права sudo](#права-sudo)) |
+| `remote SSH command failed: ...` | Скрипт на VPS завершился с ошибкой; в сообщении теперь есть последняя строка stderr | Прочитайте причину: `unsupported OS`, `sudo`, занятый `apt` lock, существующий `wg-warden0.conf`, запрет `ip_forward` |
+| Provisioning падает на `apt-get` | На свежем VPS `unattended-upgrades` держит lock | Подождите 1–2 минуты и повторите; новые версии ждут lock до 180 секунд |
+| `wg-warden0 configuration already exists and is not managed by wg-warden` | На VPS уже есть чужой конфиг с таким именем | Удалите/переименуйте `/etc/wireguard/wg-warden0.conf` или используйте другой VPS |
+| Handshake есть, интернета нет | Не разрешён `FORWARD` (Docker/ufw ставят `DROP`) | Повторите **Provision WireGuard**; проверьте `iptables -S FORWARD` и `iptables -t nat -S POSTROUTING` |
+| Handshake не проходит | UDP 51821 закрыт | `sudo ufw allow 51821/udp` и открыть UDP 51821 у провайдера |
+| `only Ubuntu and Debian are supported` | Другая ОС | Используйте Ubuntu 22.04/24.04 или Debian 12 |
 
 ## Настройки
 
@@ -276,7 +425,7 @@ sudo wg show
 | `WEB_PORT` | везде | Порт веб-интерфейса: `8080` локально, `80` на VPS без домена |
 | `PGDATA_VOLUME` | везде | Docker volume с данными PostgreSQL (на VPS по умолчанию `wg-warden_vps_pgdata`) |
 | `MONITORING_INTERVAL` | везде | Интервал опроса VPS, по умолчанию `60s` |
-| `APP_DOMAIN` | VPS | Домен панели: заполнен, значит включается HTTPS через Caddy |
+| `APP_DOMAIN` | VPS | Домен или IP панели: заполнен, значит включается HTTPS через Caddy |
 | `TLS_MODE` | VPS | `acme` (Let's Encrypt) или `internal` (самоподписанный сертификат) |
 | `HTTP_PORT`, `HTTPS_PORT` | VPS | Порты Caddy, по умолчанию `80` и `443` |
 | `APP_REGISTRATION_ENABLED` | везде | `false` по умолчанию. `true` открывает регистрацию всем (не рекомендуется) |
@@ -410,5 +559,3 @@ Frontend доступен по адресу **http://localhost:5173**, Vite пе
 - Одновременные Argon2-операции ограничены, чтобы параллельные логины не исчерпали память контейнера.
 - Не публикуйте `.env`, `.env.vps`, резервные копии, SSH-данные и клиентские профили WireGuard.
 - Профиль `dev` содержит тестовые секреты и не предназначен для реальных данных.
-
----

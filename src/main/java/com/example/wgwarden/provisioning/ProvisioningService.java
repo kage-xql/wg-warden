@@ -79,8 +79,9 @@ public class ProvisioningService {
             set -euo pipefail
             export DEBIAN_FRONTEND=noninteractive
             if ! command -v wg >/dev/null 2>&1 || ! command -v wg-quick >/dev/null 2>&1; then
-              apt-get update
-              apt-get install -y wireguard iptables
+              # На свежем VPS apt может ждать lock от unattended-upgrades.
+              apt-get -o DPkg::Lock::Timeout=180 update
+              apt-get -o DPkg::Lock::Timeout=180 install -y wireguard iptables
             fi
             install -d -m 700 /etc/wireguard
             conf=/etc/wireguard/wg-warden0.conf
@@ -104,17 +105,24 @@ public class ProvisioningService {
             Address = 10.67.0.1/24
             ListenPort = 51821
             PrivateKey = $private_key
-            PostUp = iptables -t nat -C POSTROUTING -s 10.67.0.0/24 -o $egress -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.67.0.0/24 -o $egress -j MASQUERADE
-            PostDown = iptables -t nat -D POSTROUTING -s 10.67.0.0/24 -o $egress -j MASQUERADE 2>/dev/null || true
+            PostUp = iptables -t nat -C POSTROUTING -s 10.67.0.0/24 -o $egress -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.67.0.0/24 -o $egress -j MASQUERADE; iptables -C FORWARD -i wg-warden0 -o $egress -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i wg-warden0 -o $egress -j ACCEPT; iptables -C FORWARD -o wg-warden0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -o wg-warden0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+            PostDown = iptables -t nat -D POSTROUTING -s 10.67.0.0/24 -o $egress -j MASQUERADE 2>/dev/null || true; iptables -D FORWARD -i wg-warden0 -o $egress -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o wg-warden0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
             EOF
             cat "$peers_tmp" >> "$conf"
             chmod 600 "$conf"
             printf '%s\\n' 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-wg-warden.conf
             sysctl -p /etc/sysctl.d/99-wg-warden.conf >/dev/null
+            [ "$(cat /proc/sys/net/ipv4/ip_forward)" = "1" ] || { echo 'IPv4 forwarding is not enabled; check the VPS provider restrictions' >&2; exit 23; }
             systemctl enable wg-quick@wg-warden0 >/dev/null
             if ! systemctl is-active --quiet wg-quick@wg-warden0; then
               systemctl start wg-quick@wg-warden0
             fi
+            # Docker и ufw ставят политику FORWARD в DROP, из-за чего клиент
+            # подключается (handshake проходит), но пакеты в интернет не уходят.
+            # Правила идемпотентно применяем и к уже запущенному интерфейсу.
+            iptables -t nat -C POSTROUTING -s 10.67.0.0/24 -o $egress -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.67.0.0/24 -o $egress -j MASQUERADE
+            iptables -C FORWARD -i wg-warden0 -o $egress -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i wg-warden0 -o $egress -j ACCEPT
+            iptables -C FORWARD -o wg-warden0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -o wg-warden0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
             # С закрытым UDP-портом пир поднимается, но handshake не проходит.
             if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
               ufw allow 51821/udp >/dev/null 2>&1 || true

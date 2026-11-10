@@ -18,6 +18,7 @@ import java.util.concurrent.TimeUnit;
 public class SshClientService {
     private static final Logger log = LoggerFactory.getLogger(SshClientService.class);
     private static final int MAX_OUTPUT_BYTES = 1024 * 1024;
+    private static final int MAX_ERROR_BYTES = 64 * 1024;
     public record ProbeResult(String fingerprint,String operatingSystem) {}
     public ProbeResult probe(String host,int port,String username,SshCredentials credentials,String pinnedFingerprint) {
         final String[] observed={null};
@@ -63,20 +64,37 @@ public class SshClientService {
         String reason=cause.getMessage();
         return reason==null||reason.isBlank()?cause.getClass().getSimpleName():reason;
     }
+    /** Последняя строка stderr без секретов: помогает понять, на каком шаге упал скрипт. */
+    private static String lastSafeLine(String text) {
+        String[] lines=text.split("\\R");
+        for(int i=lines.length-1;i>=0;i--) {
+            String line=lines[i].strip();
+            if(line.isEmpty()||line.contains("PRIVATE")||line.contains("PrivateKey")) continue;
+            return line.length()>300?line.substring(0,300)+"...":line;
+        }
+        return "";
+    }
     public String runSudoScript(String host,int port,String username,SshCredentials credentials,String pinnedFingerprint,String script) {
         try(SshClient client=SshClient.setUpDefaultClient()) {
             client.setServerKeyVerifier((session,address,key)->{try{return pinnedFingerprint.equals(fingerprint(key));}catch(Exception e){return false;}});
             client.start();
             try(ClientSession session=client.connect(username,host,port).verify(10,TimeUnit.SECONDS).getSession()) {
                 authenticate(session,credentials);
-                try(var channel=session.createExecChannel("sudo -n bash -s");var out=new LimitedOutputStream(MAX_OUTPUT_BYTES)) {
+                try(var channel=session.createExecChannel("sudo -n bash -s");
+                    var out=new LimitedOutputStream(MAX_OUTPUT_BYTES);
+                    var err=new LimitedOutputStream(MAX_ERROR_BYTES)) {
                     channel.setIn(new ByteArrayInputStream(script.getBytes(StandardCharsets.UTF_8)));
-                    channel.setOut(out);channel.setErr(out);channel.open().verify(10,TimeUnit.SECONDS);
+                    channel.setOut(out);channel.setErr(err);channel.open().verify(10,TimeUnit.SECONDS);
                     var events=channel.waitFor(java.util.EnumSet.of(org.apache.sshd.client.channel.ClientChannelEvent.CLOSED),TimeUnit.MINUTES.toMillis(3));
                     if(!events.contains(org.apache.sshd.client.channel.ClientChannelEvent.CLOSED))
                         throw new IOException("Remote SSH command timed out after 3 minutes");
                     if(channel.getExitStatus()==null) throw new IOException("Remote SSH command closed without an exit status");
-                    if(channel.getExitStatus()!=0) throw new IOException("Remote SSH command exited with status "+channel.getExitStatus());
+                    if(channel.getExitStatus()!=0) {
+                        // stderr содержит только диагностику скрипта; stdout с ключами в ответ не попадает.
+                        String detail=lastSafeLine(err.asString());
+                        throw new IOException("Remote SSH command exited with status "+channel.getExitStatus()
+                                +(detail.isBlank()?"":": "+detail));
+                    }
                     return out.asString().trim();
                 }
             }
