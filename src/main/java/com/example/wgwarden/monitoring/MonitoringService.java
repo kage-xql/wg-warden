@@ -101,10 +101,21 @@ public class MonitoringService {
             boolean expired=peer.getExpiresAt()!=null&&!peer.getExpiresAt().isAfter(now);
             String[] values=peerDump.getOrDefault(wg.getName(),Map.of()).get(peer.getPublicKey());
             if(values!=null){
+                long currentRx=counter(values[1]);long currentTx=counter(values[2]);
+                // Вычисляем дельту с учётом возможного сброса счётчиков при перезагрузке VPS.
+                // Если текущее значение < предыдущего — счётчик WireGuard был обнулён;
+                // в этом случае берём текущее значение как дельту (консервативно).
+                Optional<PeerMetric> prev=peerMetrics.findFirstByPeerIdOrderByTimestampDesc(peer.getId());
+                long prevRx=prev.map(PeerMetric::getRxBytes).orElse(0L);
+                long prevTx=prev.map(PeerMetric::getTxBytes).orElse(0L);
+                long deltaRx=currentRx>=prevRx?currentRx-prevRx:currentRx;
+                long deltaTx=currentTx>=prevTx?currentTx-prevTx:currentTx;
+                long delta=deltaRx+deltaTx;
+                if(delta>0){peer.addTrafficUsedBytes(delta);peers.save(peer);}
                 long epoch=counter(values[0]);Instant handshake=epoch==0?null:Instant.ofEpochSecond(epoch);
-                PeerMetric metric=peerMetrics.save(new PeerMetric(peer.getId(),now,counter(values[1]),counter(values[2]),handshake));
-                boolean overTraffic=peer.getTrafficLimitBytes()!=null&&counter(values[1])+counter(values[2])>=peer.getTrafficLimitBytes();
-                if(expired||overTraffic)try{peerService.disableForLimit(server.getUserId(),peer);}catch(RuntimeException e){log.warn("Could not disable limited peer {}",peer.getId(),e);}
+                PeerMetric metric=peerMetrics.save(new PeerMetric(peer.getId(),now,currentRx,currentTx,handshake));
+                boolean overTraffic=peer.getTrafficLimitBytes()!=null&&peer.getTrafficUsedBytes()>=peer.getTrafficLimitBytes();
+                if((expired||overTraffic)&&peer.isEnabled())try{peerService.disableForLimit(server.getUserId(),peer);}catch(RuntimeException e){log.warn("Could not disable limited peer {}",peer.getId(),e);}
                 peerUpdates.add(new MonitorUpdate.PeerUpdate(peer.getId(),peer.isEnabled(),PeerMetricResponse.from(metric)));
             } else if(expired&&peer.isEnabled()){
                 try{peerService.disableForLimit(server.getUserId(),peer);}catch(RuntimeException e){log.warn("Could not disable expired peer {}",peer.getId(),e);}

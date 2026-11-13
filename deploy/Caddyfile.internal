@@ -3,8 +3,14 @@
 #
 # Клиенты не отправляют SNI, если подключаются по IP-адресу (это требует RFC 6066).
 # Без default_sni Caddy не может выбрать сертификат и рвёт handshake с internal error.
+#
+# HTTP/3 отключён намеренно: самоподписанному сертификату нельзя доверять в QUIC,
+# и Safari после alt-svc переключается на h3, где вход падает с "Load failed".
 {
 	default_sni {$APP_DOMAIN}
+	servers {
+		protocols h1 h2
+	}
 }
 
 {$APP_DOMAIN} {

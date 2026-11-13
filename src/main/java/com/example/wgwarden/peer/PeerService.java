@@ -55,8 +55,8 @@ public class PeerService {
         Peer peer=ownedPeer(userId,peerId);
         if(request.name()!=null){String name=request.name().trim();if(name.isBlank())throw new IllegalArgumentException("peer name cannot be blank");peer.setName(name);}
         if(request.privateKey()!=null&&!request.privateKey().isBlank())peer.setEncryptedPrivateKey(crypto.encrypt(request.privateKey().trim().getBytes(java.nio.charset.StandardCharsets.UTF_8)));
-        if(Boolean.TRUE.equals(request.clearTrafficLimit())){peer.setTrafficLimitBytes(null);}
-        else if(request.trafficLimitBytes()!=null){peer.setTrafficLimitBytes(request.trafficLimitBytes()>0?request.trafficLimitBytes():null);}
+        if(Boolean.TRUE.equals(request.clearTrafficLimit())){peer.setTrafficLimitBytes(null);peer.resetTrafficUsedBytes();}
+        else if(request.trafficLimitBytes()!=null){peer.setTrafficLimitBytes(request.trafficLimitBytes()>0?request.trafficLimitBytes():null);peer.resetTrafficUsedBytes();}
         if(Boolean.TRUE.equals(request.clearExpiresAt())){peer.setExpiresAt(null);}
         else if(request.expiresAt()!=null){peer.setExpiresAt(request.expiresAt());}
         peers.save(peer);

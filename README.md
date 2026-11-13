@@ -240,12 +240,26 @@ grep -q '^TLS_MODE=' .env.vps || echo 'TLS_MODE=internal' >> .env.vps
 ./deploy/vps-install.sh
 ```
 
-Открывайте `https://<IP>`, в предупреждении браузера — «Дополнительно → Перейти на сайт». Чтобы убрать предупреждение, можно вытащить корневой сертификат Caddy и установить его на свои устройства:
+Открывайте `https://<IP>`, в предупреждении браузера — «Дополнительно → Перейти на сайт». Чтобы убрать предупреждение (и проблемы с входом в Safari), вытащите корневой сертификат Caddy и сделайте его доверенным на своих устройствах:
 
 ```bash
 docker compose -f docker-compose.tls.yml --env-file .env.vps \
   exec caddy cat /data/caddy/pki/authorities/local/root.crt > caddy-root.crt
 ```
+
+macOS (нужен пароль администратора):
+
+```bash
+sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain caddy-root.crt
+```
+
+Windows: двойной клик по `caddy-root.crt` → «Установить сертификат» → «Локальный компьютер» → «Доверенные корневые центры сертификации».
+
+iOS/iPadOS: отправьте `caddy-root.crt` на устройство, откройте → «Профиль загружен» → «Установить», затем **Настройки → Основные → Об этом устройстве → Доверие сертификатам** → включите `Caddy Local Authority`.
+
+> [!IMPORTANT]
+> Safari не переносит исключение «Перейти на сайт» на запросы `fetch`/XHR: страница открывается, а вход падает с `Load failed`. В Chrome/Firefox после «Proceed» вход обычно работает. Надёжно лечится доверенным сертификатом (команды выше) или доменом с Let's Encrypt.
 
 #### Переключение между HTTP и HTTPS
 
@@ -385,6 +399,7 @@ sudo ufw status | grep 51821
 | Симптом | Причина | Что сделать |
 | --- | --- | --- |
 | `tlsv1 alert internal error`, `ERR_SSL_PROTOCOL_ERROR` на `https://<IP>` | Клиент не отправляет SNI при подключении по IP, Caddy не может выбрать сертификат | Убедиться, что в `deploy/Caddyfile.internal` есть `default_sni {$APP_DOMAIN}` (в актуальной версии есть), затем: `docker compose -f docker-compose.tls.yml --env-file .env.vps restart caddy` |
+| Вход падает с `Load failed` (Safari), страница при этом открывается | Самоподписанный сертификат: Safari не применяет исключение «Перейти на сайт» к `fetch`/XHR | Установить корневой сертификат Caddy как доверенный (см. «Вариант B») или перейти на домен с Let's Encrypt; временно — открыть в Chrome/Firefox |
 | `could not find a network matching network mode wg-warden_default` | Переключение HTTP ↔ HTTPS: Compose удалил старую сеть раньше контейнеров | `docker compose -f docker-compose.tls.yml --env-file .env.vps down --remove-orphans` и снова `./deploy/vps-install.sh`. Новый установщик делает это сам |
 | `port is already allocated` для 80/443 | Старый стек или другой сервис держит порт | `docker ps`, затем `./deploy/vps-service.sh stop` и `./deploy/vps-install.sh`; проверьте `sudo ss -ltnp \| grep -E ':80\|:443'` |
 | Let's Encrypt не выпускает сертификат | Нет A-записи, закрыт 80/tcp, мешает прокси Cloudflare | `dig +short panel.example.com`; откройте 80/tcp в ufw и у провайдера; логи Caddy: `docker compose -f docker-compose.tls.yml --env-file .env.vps logs --tail=100 caddy` |
