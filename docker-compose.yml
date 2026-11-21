@@ -8,8 +8,6 @@ services:
       POSTGRES_DB: wgwarden
       POSTGRES_USER: ${DB_USER:-wgwarden}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-wgwarden}
-    ports:
-      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
